@@ -30,9 +30,13 @@ that trade atomic:
   code that calls `unlock` again (Universal Router, V4-based aggregators, possibly a yield
   strategy's `skimSurplus`) reverts `AlreadyUnlocked`. Route steps that touch V4 must call
   `poolManager.swap` directly. Fork tests must prove the live SYA strategies do not nest.
-- **Routes are stored on-chain, keyed by token**, as an ordered list of steps (Curve stableswap-ng,
-  Curve crypto, Uniswap V4 direct swap, ERC4626 redeem). Each step swaps the harvester's entire
-  balance of its input token, so no amounts are passed in calldata. Routes are owner-settable.
+- **Routes are stored on-chain, keyed by token**, as a Curve Router NG route to USDC
+  (`address[11] path`, `uint256[5][5] swapParams`, `address[5] pools`). Router NG executes up to five
+  hops in one `exchange` call, which covers the multi-hop DOLA and USDe paths. This mirrors the
+  workspace precedent `vault/src/AMMAdapters/CurveAMMAdapter.sol` (Router NG at
+  `0x16C6521Dff6baB339122a0FE25a9116693265353`). Each route swaps the harvester's entire balance of
+  the token, so no amounts are passed in calldata. Routes are owner-settable. The final USDC→ETH leg
+  is a direct `poolManager.swap` in a native-ETH/USDC Uniswap V4 pool, inside the same unlock.
 - **One slippage check.** The call is atomic, so the only number that protects the caller is the
   ETH they receive: a single `minEthOut`. There are no per-token minimums. SYA's own
   `minRewardTokenSupplied` is passed as 0.
