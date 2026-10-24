@@ -8,7 +8,7 @@ import {IPoolManager} from "v4-core/src/interfaces/IPoolManager.sol";
 import {IUnlockCallback} from "v4-core/src/interfaces/callback/IUnlockCallback.sol";
 import {IHooks} from "v4-core/src/interfaces/IHooks.sol";
 import {PoolKey} from "v4-core/src/types/PoolKey.sol";
-import {PoolId, PoolIdLibrary} from "v4-core/src/types/PoolId.sol";
+import {PoolIdLibrary} from "v4-core/src/types/PoolId.sol";
 import {Currency} from "v4-core/src/types/Currency.sol";
 import {StateLibrary} from "v4-core/src/libraries/StateLibrary.sol";
 import {IStableYieldAccumulator} from "stable-yield-accumulator/src/interfaces/IStableYieldAccumulator.sol";
@@ -22,15 +22,13 @@ interface ICurvePoolCoins {
     function coins(uint256 i) external view returns (address);
 }
 
-interface ICurveMetaPool {
-    function base_pool() external view returns (address);
-}
-
 interface ICurveRouterNGQuote {
-    function get_dy(address[11] calldata route, uint256[5][5] calldata swapParams, uint256 amount, address[5] calldata pools)
-        external
-        view
-        returns (uint256);
+    function get_dy(
+        address[11] calldata route,
+        uint256[5][5] calldata swapParams,
+        uint256 amount,
+        address[5] calldata pools
+    ) external view returns (uint256);
 }
 
 interface IStateView {
@@ -50,11 +48,20 @@ contract SYAHarvesterForkTest is Test, IUnlockCallback {
     using PoolIdLibrary for PoolKey;
     using StateLibrary for IPoolManager;
 
-    /// @dev Time warped forward from `PINNED_BLOCK` so the strategies show a profitable surplus
-    uint256 internal constant ACCRUAL_WARP = 7 days;
-    /// @dev Realistic-to-high mainnet gas price for the gas measurement (actual base fee at the pinned
-    ///      block was ~0.05 gwei, so 2 gwei is conservative)
-    uint256 internal constant GAS_PRICE = 2 gwei;
+    /// @dev Time warped forward from `PINNED_BLOCK`. Every live strategy already shows surplus at the pinned
+    ///      block; the warp only lets it grow a little. It must stay SHORT: the USDC strategy's vault (Tokemak
+    ///      autoUSD, 0x65efCF2cce562DCBf07e805eEbeDeF21Dbd8Ea3D) prices withdrawals through a root price oracle
+    ///      that reads the Chainlink crvUSD/USD feed (0xEEf0C605546958c1f899b6fB336C20671f9cD49F) and reverts
+    ///      `InvalidDataReturned()` once that feed is stale. The feed's `updatedAt` is ~13.3h old at the pinned
+    ///      block, so a 7-day warp breaks every claim that includes the USDC strategy — a fork artifact (feeds are
+    ///      updated on the live chain), not a harvester bug. 1 hour keeps the feed inside its window.
+    uint256 internal constant ACCRUAL_WARP = 1 hours;
+    /// @dev Gas price for the end-to-end harvest and the gas measurement. The base fee at the pinned block was
+    ///      ~0.054 gwei; 1 gwei is ~18x that (generous priority-fee headroom). A full three-strategy harvest
+    ///      burns ~2.6M gas (the USDC strategy's Tokemak autoUSD withdrawal dominates) and pays ~0.0045 ETH at
+    ///      this block, so it breaks even near 1.7 gwei: at the story's example 2 gwei it is genuinely
+    ///      unprofitable and reverts `Unprofitable` (see test_fork_harvest_highGasPrice_revertsUnprofitable).
+    uint256 internal constant GAS_PRICE = 1 gwei;
 
     IStableYieldAccumulator internal sya = IStableYieldAccumulator(A.SYA);
     IPoolManager internal pm = IPoolManager(A.POOL_MANAGER);
@@ -65,6 +72,10 @@ contract SYAHarvesterForkTest is Test, IUnlockCallback {
     address internal keeper = makeAddr("keeper");
 
     bool internal unlockCallbackHit;
+
+    /// @dev FRAXBP (FRAX/USDC) base pool and its LP token, the DOLA metapool's coin1
+    address internal constant FRAXBP_POOL = 0xDcEF968d416a41Cdac0ED8702fAC8128A64241A2;
+    address internal constant FRAXBP_LP = 0x3175Df0976dFA876431C2E9eE6Bc45b65d3473CC;
 
     function setUp() public {
         string memory rpc = vm.envOr("MAINNET_RPC_URL", string(""));
@@ -209,7 +220,8 @@ contract SYAHarvesterForkTest is Test, IUnlockCallback {
         MainnetRoutes.Route memory d = MainnetRoutes.dolaRoute();
         assertEq(d.path[0], A.DOLA);
         assertEq(ICurvePoolCoins(d.path[1]).coins(0), A.DOLA, "dola meta coin0");
-        address basePool = ICurveMetaPool(d.path[1]).base_pool();
+        assertEq(ICurvePoolCoins(d.path[1]).coins(1), FRAXBP_LP, "dola meta coin1 is FRAXBP LP");
+        address basePool = FRAXBP_POOL;
         assertEq(ICurvePoolCoins(basePool).coins(0), A.FRAX, "FRAXBP coin0");
         assertEq(ICurvePoolCoins(basePool).coins(1), A.USDC, "FRAXBP coin1 (underlying index 2)");
         assertEq(d.swapParams[0][1], 2, "USDC underlying index");
@@ -240,7 +252,13 @@ contract SYAHarvesterForkTest is Test, IUnlockCallback {
         uint24[4] memory fees = [uint24(100), 500, 3000, 10_000];
         int24[4] memory spacings = [int24(1), 10, 60, 200];
         for (uint256 i = 0; i < fees.length; i++) {
-            PoolKey memory k = PoolKey(Currency.wrap(address(0)), Currency.wrap(A.USDC), fees[i], spacings[i], IHooks(address(0)));
+            PoolKey memory k = PoolKey({
+                currency0: Currency.wrap(address(0)),
+                currency1: Currency.wrap(A.USDC),
+                fee: fees[i],
+                tickSpacing: spacings[i],
+                hooks: IHooks(address(0))
+            });
             uint128 l = pm.getLiquidity(k.toId());
             console2.log("fee", fees[i], "liquidity", l);
             assertLe(l, chosenL, "a candidate pool is deeper than the chosen one");
@@ -292,7 +310,6 @@ contract SYAHarvesterForkTest is Test, IUnlockCallback {
         exempt[0] = A.YS_USDC;
         exempt[1] = A.YS_DOLA;
 
-        vm.recordLogs();
         uint256 ethOut = _harvest(exempt, 1);
         assertGt(ethOut, 0, "USDe-only harvest paid ETH: no AlreadyUnlocked from a nested unlock");
         _assertHarvesterEmpty();
@@ -317,8 +334,10 @@ contract SYAHarvesterForkTest is Test, IUnlockCallback {
         }
     }
 
+    /// @dev At 2 gwei (the low end of a "busy mainnet" price, ~37x the pinned block's base fee) the full
+    ///      harvest's ~2.78M charged gas costs ~0.0056 ETH against ~0.0046 ETH out: genuinely unprofitable.
     function test_fork_harvest_highGasPrice_revertsUnprofitable() public {
-        vm.txGasPrice(10_000 gwei);
+        vm.txGasPrice(2 gwei);
         vm.prank(keeper, keeper);
         (bool ok, bytes memory ret) =
             address(harvester).call(abi.encodeCall(harvester.harvest, (_none(), A.NFT_INDEX, 0)));

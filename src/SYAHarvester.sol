@@ -47,8 +47,17 @@ contract SYAHarvester is Ownable, ERC1155Holder, IUnlockCallback {
 
     /// @notice Gas charged on top of the gas measured between entry and the profitability check: the
     ///         intrinsic transaction cost, calldata, the ETH payout and everything after the measurement.
-    /// @dev PLACEHOLDER — story 004 calibrates this from a mainnet-fork measurement.
-    uint256 public constant GAS_OVERHEAD = 50_000;
+    /// @dev Calibrated (story 004) on a mainnet fork at block 26_261_000 (+1h warp), full three-strategy
+    ///      harvest with NFT index 1, `vm.txGasPrice` 1 gwei:
+    ///      - in-contract estimate `g0 - gasleft()` at the check: 2_720_016 gas (identical in forge and on an
+    ///        anvil fork, read back from an `Unprofitable` revert at a huge gas price);
+    ///      - real gas before refunds (forge: 21_000 intrinsic + calldata + gas measured around the external
+    ///        call): 2_777_404 — gap 57_388, an upper bound (it also charges the test's cold CALL);
+    ///      - real anvil receipt `gasUsed` (after EIP-3529 refunds): 2_273_493, i.e. ~0.5M below the estimate.
+    ///      Set to the pre-refund gap rounded up: refunds depend on live state and are not counted on, so the
+    ///      check stays conservative (it may over-charge by the refund, never under-charge).
+    ///      Re-checked by `test/fork/SYAHarvester.fork.t.sol::test_fork_gasOverhead_coversMeasuredGap`.
+    uint256 public constant GAS_OVERHEAD = 60_000;
 
     /// @dev yield token => route to SYA's reward token
     mapping(address => CurveRoute) private routes;
