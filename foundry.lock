@@ -4,5 +4,23 @@
       "name": "v1.17.0",
       "rev": "f3dae6e6ee381f25eb6a246f7da9b85c91a68219"
     }
+  },
+  "lib/openzeppelin-contracts": {
+    "tag": {
+      "name": "v5.1.0",
+      "rev": "69c8def5f222ff96f2b5beff05dfba996368aa79"
+    }
+  },
+  "lib/stable-yield-accumulator": {
+    "branch": {
+      "name": "master",
+      "rev": "6eab35c3d511f4a241e17672d5daacf78b03e029"
+    }
+  },
+  "lib/v4-core": {
+    "tag": {
+      "name": "v4.0.0",
+      "rev": "e50237c43811bd9b526eff40f26772152a42daba"
+    }
   }
 }
