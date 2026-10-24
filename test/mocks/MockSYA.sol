@@ -4,6 +4,11 @@ pragma solidity 0.8.26;
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {IERC20Metadata} from "@openzeppelin/contracts/token/ERC20/extensions/IERC20Metadata.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
+import {IERC1155} from "@openzeppelin/contracts/token/ERC1155/IERC1155.sol";
+
+interface IMockNFTMinter {
+    function burn(address from, uint256 id, uint256 amount) external;
+}
 
 interface IMockStrategy {
     function surplus() external view returns (uint256);
@@ -15,13 +20,27 @@ interface IMockStrategy {
 ///      validate exempt entries, skip zero-token / paused-token / exempt strategies, PUSH yield via
 ///      `skimSurplus` first, charge on the ACTUAL delivered amount (normalised to 18 decimals)
 ///      x (10000 - discountRate) / 10000, then PULL the payment with `safeTransferFrom`.
-///      `nftIndex` is ignored here (story 003 adds the NFT burn).
+///      NFT handling has two modes:
+///      - `Ignore` (default, post-gating-off behaviour): `nftIndex` is left untouched.
+///      - `Burn` (live behaviour, StableYieldAccumulator.sol:657-666): requires a configured minter
+///        and `nftIndex > 0`, then burns one unit of `nftIndex` from `msg.sender` as an authorized
+///        burner, else reverts `NoValidNFT`.
 contract MockSYA {
     using SafeERC20 for IERC20;
 
     error ExemptStrategyNotRegistered();
     error ZeroAmount();
     error InsufficientYield();
+    error NoValidNFT();
+
+    enum NftMode {
+        Ignore,
+        Burn
+    }
+
+    NftMode public nftMode;
+    /// @dev `msg.sender`'s balance of `nftIndex` observed inside the last `claim` (Ignore mode, minter set)
+    uint256 public nftBalanceSeenInClaim;
 
     address public rewardToken;
     address public nftMinter;
@@ -48,6 +67,10 @@ contract MockSYA {
         nftMinter = _nftMinter;
     }
 
+    function setNftMode(NftMode mode) external {
+        nftMode = mode;
+    }
+
     function setDiscountRate(uint256 rate) external {
         discountRate = rate;
     }
@@ -70,9 +93,16 @@ contract MockSYA {
         return yieldStrategies;
     }
 
-    function claim(uint256, /* nftIndex */ uint256 minRewardTokenSupplied, address[] calldata exemptStrategies)
-        external
-    {
+    function claim(uint256 nftIndex, uint256 minRewardTokenSupplied, address[] calldata exemptStrategies) external {
+        if (nftMode == NftMode.Burn) {
+            require(nftMinter != address(0), "NFT minter not configured");
+            require(nftIndex > 0, "Invalid index");
+            if (IERC1155(nftMinter).balanceOf(msg.sender, nftIndex) == 0) revert NoValidNFT();
+            IMockNFTMinter(nftMinter).burn(msg.sender, nftIndex, 1);
+        } else if (nftMinter != address(0) && nftIndex != 0) {
+            nftBalanceSeenInClaim = IERC1155(nftMinter).balanceOf(msg.sender, nftIndex);
+        }
+
         _validateExempt(exemptStrategies);
 
         uint256 totalNormalizedYield;
@@ -114,11 +144,7 @@ contract MockSYA {
         }
     }
 
-    function _skip(address strategy, address token, address[] calldata exemptStrategies)
-        internal
-        view
-        returns (bool)
-    {
+    function _skip(address strategy, address token, address[] calldata exemptStrategies) internal view returns (bool) {
         if (token == address(0)) return true;
         if (tokenPaused[token]) return true;
         for (uint256 j = 0; j < exemptStrategies.length; j++) {
