@@ -5,6 +5,8 @@ import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import {SafeCast} from "@openzeppelin/contracts/utils/math/SafeCast.sol";
+import {IERC1155} from "@openzeppelin/contracts/token/ERC1155/IERC1155.sol";
+import {ERC1155Holder} from "@openzeppelin/contracts/token/ERC1155/utils/ERC1155Holder.sol";
 import {IPoolManager} from "v4-core/src/interfaces/IPoolManager.sol";
 import {IUnlockCallback} from "v4-core/src/interfaces/callback/IUnlockCallback.sol";
 import {PoolKey} from "v4-core/src/types/PoolKey.sol";
@@ -22,7 +24,7 @@ import {ICurveRouterNG} from "./interfaces/ICurveRouterNG.sol";
  * @dev The whole harvest runs inside one Uniswap V4 `PoolManager.unlock` (free flash accounting).
  *      The contract is public and stateless between calls: all profit goes to `msg.sender`.
  */
-contract SYAHarvester is Ownable, IUnlockCallback {
+contract SYAHarvester is Ownable, ERC1155Holder, IUnlockCallback {
     using SafeERC20 for IERC20;
 
     /// @notice Stored Curve Router NG route that sells one yield token to SYA's reward token
@@ -42,6 +44,11 @@ contract SYAHarvester is Ownable, IUnlockCallback {
 
     /// @notice Extra borrow on top of `sya.calculateClaimAmount`, in basis points (1%)
     uint256 public constant BORROW_BUFFER_BPS = 100;
+
+    /// @notice Gas charged on top of the gas measured between entry and the profitability check: the
+    ///         intrinsic transaction cost, calldata, the ETH payout and everything after the measurement.
+    /// @dev PLACEHOLDER — story 004 calibrates this from a mainnet-fork measurement.
+    uint256 public constant GAS_OVERHEAD = 50_000;
 
     /// @dev yield token => route to SYA's reward token
     mapping(address => CurveRoute) private routes;
@@ -76,6 +83,8 @@ contract SYAHarvester is Ownable, IUnlockCallback {
     error EthPoolNotSet();
     /// @notice Paying the ETH out to the caller failed
     error EthTransferFailed();
+    /// @notice The ETH produced does not cover the gas the transaction burns at `tx.gasprice`
+    error Unprofitable(uint256 ethOut, uint256 gasCost);
 
     /**
      * @param _owner Initial owner allowed to manage routes and the ETH pool
@@ -169,6 +178,7 @@ contract SYAHarvester is Ownable, IUnlockCallback {
     function getEthPool() external view returns (PoolKey memory) {
         return ethPool;
     }
+
     /*//////////////////////////////////////////////////////////////
                                  HARVEST
     //////////////////////////////////////////////////////////////*/
@@ -176,25 +186,61 @@ contract SYAHarvester is Ownable, IUnlockCallback {
     /**
      * @notice Claim from SYA with flash-borrowed reward token, sell the yield and pay the profit in ETH
      * @param exemptStrategies Registered SYA strategies to skip (passed through to `sya.claim`)
-     * @param nftIndex Claim NFT index, passed through to `sya.claim` untouched
+     * @param nftIndex Claim NFT index, passed through to `sya.claim`. `0` means "transfer no NFT".
      * @param minEthOut Minimum ETH the caller accepts. This is the ONLY slippage check: the whole call
      *        is atomic, so per-token minimums add nothing. Routes are executed with zero expected
      *        output and SYA's own `minRewardTokenSupplied` is passed as 0.
      * @return ethOut ETH paid to `msg.sender`
-     * @dev Opens a single `poolManager.unlock`; see `unlockCallback` for the flow. Nested-unlock
-     *      hazard: anything called from inside the callback (a strategy's `skimSurplus`, a route step)
-     *      that calls `poolManager.unlock` again reverts `AlreadyUnlocked` and fails the harvest.
+     * @dev Order: gas snapshot, NFT pull, `poolManager.unlock` (see `unlockCallback`), NFT refund,
+     *      `minEthOut` check, gas check, ETH payout. Every state change precedes the external ETH call.
+     *
+     *      Claim NFT. When `nftIndex != 0` and `sya.nftMinter()` (read at call time) is non-zero, one unit
+     *      of `nftIndex` is pulled from the caller before the unlock, which needs the caller's
+     *      `setApprovalForAll(harvester, true)`; without it the pull reverts. SYA burns the unit from the
+     *      harvester as an authorized burner on the NFT minter, so the harvester grants no approval.
+     *      After the unlock the harvester's WHOLE balance of `nftIndex` (including any stray units) is
+     *      returned to the caller. Today's SYA always burns the unit or reverts, so the refund only
+     *      fires once NFT gating is switched off in SYA. Likewise, with today's live SYA,
+     *      `nftIndex == 0` reverts `"Invalid index"` and `nftMinter() == address(0)` reverts
+     *      `"NFT minter not configured"` inside `claim`: those skip-transfer paths only succeed after
+     *      the future yield-accumulator gating-off story lands.
+     *
+     *      Gas check. Reverts `Unprofitable` if
+     *      `ethOut < (gasleft() at entry - gasleft() before payout + GAS_OVERHEAD) * tx.gasprice`.
+     *      Simulations run at a zero gas price (most wallet `eth_call`s) pass this check trivially, so
+     *      off-chain tooling must simulate with fee fields set.
+     *
+     *      Nested-unlock hazard: anything called from inside the callback (a strategy's `skimSurplus`,
+     *      a route step) that calls `poolManager.unlock` again reverts `AlreadyUnlocked` and fails the
+     *      harvest.
      */
     function harvest(address[] calldata exemptStrategies, uint256 nftIndex, uint256 minEthOut)
         external
         returns (uint256 ethOut)
     {
+        uint256 g0 = gasleft();
         if (Currency.unwrap(ethPool.currency1) == address(0)) revert EthPoolNotSet();
+
+        address nftAddr = sya.nftMinter();
+        bool moveNft = nftIndex != 0 && nftAddr != address(0);
+        if (moveNft) {
+            IERC1155(nftAddr).safeTransferFrom(msg.sender, address(this), nftIndex, 1, "");
+        }
 
         poolManager.unlock(abi.encode(exemptStrategies, nftIndex));
 
+        if (moveNft) {
+            uint256 bal = IERC1155(nftAddr).balanceOf(address(this), nftIndex);
+            if (bal != 0) {
+                IERC1155(nftAddr).safeTransferFrom(address(this), msg.sender, nftIndex, bal, "");
+            }
+        }
+
         ethOut = address(this).balance;
         if (ethOut < minEthOut) revert InsufficientEthOut(ethOut, minEthOut);
+
+        uint256 gasCost = (g0 - gasleft() + GAS_OVERHEAD) * tx.gasprice;
+        if (ethOut < gasCost) revert Unprofitable(ethOut, gasCost);
 
         (bool ok,) = msg.sender.call{value: ethOut}("");
         if (!ok) revert EthTransferFailed();
