@@ -7,6 +7,8 @@
 # Foundry keystore, and drives `script/harvest.sh` through:
 #   1. a raw private key in the environment          -> refused, no tx sent
 #   2. an unprofitable run (huge MIN_PROFIT_WEI)     -> aborts before sending, nonce unchanged, exit != 0
+#   2b. a 10 gwei tip                              -> the ON-CHAIN Unprofitable check fires in simulation, which
+#                                                     proves the fee fields reach tx.gasprice; decoded, no tx sent
 #   3. a simulated revert (DOLA route cleared)       -> aborts, prints RouteNotConfigured(<DOLA>), no tx sent
 #   4. DRY_RUN=1                                     -> prints minEthOut, exit 0, no tx sent
 #   5. a profitable run                              -> exit 0, tx sent, operator ETH up, harvester holds nothing
@@ -64,7 +66,7 @@ pass() { echo "  PASS: $*"; PASS=$((PASS + 1)); }
 fail() { echo "  FAIL: $*"; FAIL=$((FAIL + 1)); }
 
 echo "== Starting anvil (fork block $FORK_BLOCK, port $ANVIL_PORT)"
-anvil --fork-url "$MAINNET_RPC_URL" --fork-block-number "$FORK_BLOCK" --chain-id 31337 \
+anvil --fork-url "$MAINNET_RPC_URL" --fork-block-number "$FORK_BLOCK" --chain-id 31337 --timeout 120000 --retries 10 \
   --port "$ANVIL_PORT" --silent >"$TMP/anvil.log" 2>&1 &
 ANVIL_PID=$!
 for _ in $(seq 1 120); do
@@ -124,12 +126,18 @@ run_harvest() {
     NFT_INDEX="$NFT_INDEX" \
     KEYSTORE_ACCOUNT=harvest-test-operator \
     KEYSTORE_PASSWORD_FILE="$TMP/password" \
+    RPC_TIMEOUT=600 \
     "$@" bash "$HARVEST_SH"
 }
 
 nonce() { cast nonce "$OPERATOR" --rpc-url "$RPC"; }
 balance() { cast balance "$1" --rpc-url "$RPC"; }
 erc20() { cast call --rpc-url "$RPC" "$1" "balanceOf(address)(uint256)" "$2" | awk '{print $1}'; }
+
+# Warm anvil's fork cache: the first harvest pulls a lot of remote state, which can outlast a default timeout.
+echo "== Warming the fork cache (one fee-carrying harvest eth_call)"
+cast call --rpc-url "$RPC" --rpc-timeout 900 --from "$OPERATOR" --gas-price 2000000000 --priority-gas-price 1000000000 \
+  "$HARVESTER" "harvest(address[],uint256,uint256)(uint256)" "[]" "$NFT_INDEX" 0 >/dev/null 2>&1 || true
 
 if [[ ! -f "$HARVEST_SH" ]]; then
   echo "FAIL: $HARVEST_SH does not exist"
@@ -162,9 +170,21 @@ grep -q "simulatedEthOut" <<<"$OUT" && pass "numbers printed" || fail "numbers n
 grep -q "anvil-test-only" <<<"$OUT" && fail "keystore password echoed" || pass "keystore password not echoed"
 
 # ---------------------------------------------------------------------------------------------------------
+echo "== Case 2b: high tip -> the contract's own Unprofitable check fires in simulation (fees reach tx.gasprice)"
+N0="$(nonce)"
+set +e
+OUT="$(run_harvest PRIORITY_FEE_WEI=10000000000 2>&1)"; RC=$?
+set -e
+echo "$OUT" | sed 's/^/     | /'
+[[ $RC -ne 0 ]] && pass "exit code $RC" || fail "expected non-zero exit, got $RC"
+grep -qE "reason: Unprofitable\([0-9]+, [0-9]+\)" <<<"$OUT" && pass "on-chain Unprofitable(ethOut, gasCost) decoded" \
+  || fail "Unprofitable not decoded (fee fields may not reach tx.gasprice)"
+[[ "$(nonce)" == "$N0" ]] && pass "nonce unchanged ($N0)" || fail "nonce moved"
+
+# ---------------------------------------------------------------------------------------------------------
 echo "== Case 3: simulated revert (DOLA route cleared) -> decoded reason, abort"
 SNAP="$(cast rpc evm_snapshot --rpc-url "$RPC" | tr -d '"')"
-cast send --rpc-url "$RPC" --unlocked --from "$OWNER" "$HARVESTER" "clearRoute(address)" "$DOLA" >/dev/null
+cast send --rpc-url "$RPC" --rpc-timeout 600 --unlocked --from "$OWNER" "$HARVESTER" "clearRoute(address)" "$DOLA" >/dev/null
 N0="$(nonce)"
 set +e
 OUT="$(run_harvest 2>&1)"; RC=$?
