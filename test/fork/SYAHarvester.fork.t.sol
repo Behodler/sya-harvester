@@ -1,0 +1,389 @@
+// SPDX-License-Identifier: MIT
+pragma solidity 0.8.26;
+
+import {Test, console2} from "forge-std/Test.sol";
+import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import {IERC1155} from "@openzeppelin/contracts/token/ERC1155/IERC1155.sol";
+import {IPoolManager} from "v4-core/src/interfaces/IPoolManager.sol";
+import {IUnlockCallback} from "v4-core/src/interfaces/callback/IUnlockCallback.sol";
+import {IHooks} from "v4-core/src/interfaces/IHooks.sol";
+import {PoolKey} from "v4-core/src/types/PoolKey.sol";
+import {PoolId, PoolIdLibrary} from "v4-core/src/types/PoolId.sol";
+import {Currency} from "v4-core/src/types/Currency.sol";
+import {StateLibrary} from "v4-core/src/libraries/StateLibrary.sol";
+import {IStableYieldAccumulator} from "stable-yield-accumulator/src/interfaces/IStableYieldAccumulator.sol";
+
+import {SYAHarvester} from "../../src/SYAHarvester.sol";
+import {ICurveRouterNG} from "../../src/interfaces/ICurveRouterNG.sol";
+import {MainnetAddresses as A} from "./MainnetAddresses.sol";
+import {MainnetRoutes} from "./MainnetRoutes.sol";
+
+interface ICurvePoolCoins {
+    function coins(uint256 i) external view returns (address);
+}
+
+interface ICurveMetaPool {
+    function base_pool() external view returns (address);
+}
+
+interface ICurveRouterNGQuote {
+    function get_dy(address[11] calldata route, uint256[5][5] calldata swapParams, uint256 amount, address[5] calldata pools)
+        external
+        view
+        returns (uint256);
+}
+
+interface IStateView {
+    function poolManager() external view returns (address);
+}
+
+interface ITotalSupply1155 {
+    function totalSupply(uint256 id) external view returns (uint256);
+}
+
+/// @title SYAHarvesterForkTest
+/// @notice Story 004: the complete harvester (001–003) against live mainnet state at a pinned block.
+/// @dev Run with `MAINNET_RPC_URL` set to an ARCHIVE-capable endpoint (the block is pinned):
+///        MAINNET_RPC_URL=<archive rpc> forge test --match-path test/fork/SYAHarvester.fork.t.sol -vv
+///      Without `MAINNET_RPC_URL` every test in this contract is skipped (reported as skipped, not passed).
+contract SYAHarvesterForkTest is Test, IUnlockCallback {
+    using PoolIdLibrary for PoolKey;
+    using StateLibrary for IPoolManager;
+
+    /// @dev Time warped forward from `PINNED_BLOCK` so the strategies show a profitable surplus
+    uint256 internal constant ACCRUAL_WARP = 7 days;
+    /// @dev Realistic-to-high mainnet gas price for the gas measurement (actual base fee at the pinned
+    ///      block was ~0.05 gwei, so 2 gwei is conservative)
+    uint256 internal constant GAS_PRICE = 2 gwei;
+
+    IStableYieldAccumulator internal sya = IStableYieldAccumulator(A.SYA);
+    IPoolManager internal pm = IPoolManager(A.POOL_MANAGER);
+    IERC1155 internal nft = IERC1155(A.NFT_MINTER);
+
+    SYAHarvester internal harvester;
+    address internal owner = makeAddr("harvesterOwner");
+    address internal keeper = makeAddr("keeper");
+
+    bool internal unlockCallbackHit;
+
+    function setUp() public {
+        string memory rpc = vm.envOr("MAINNET_RPC_URL", string(""));
+        if (bytes(rpc).length == 0) {
+            console2.log("MAINNET_RPC_URL unset: skipping the mainnet fork suite");
+            vm.skip(true);
+            return;
+        }
+        vm.createSelectFork(vm.rpcUrl("mainnet"), A.PINNED_BLOCK);
+
+        harvester = new SYAHarvester(owner, pm, sya, ICurveRouterNG(A.CURVE_ROUTER_NG));
+        vm.label(address(harvester), "SYAHarvester");
+        vm.startPrank(owner);
+        MainnetRoutes.configure(harvester);
+        vm.stopPrank();
+
+        // Claim NFT, method 1 of 3 (preferred): prank an existing holder of a valid index and transfer one
+        // unit. NFT_HOLDER is an EOA with exactly 1 unit of index 1 at PINNED_BLOCK, so neither
+        // `setAuthorizedMinter`+`mintFor` (method 2) nor the paid `mint` (method 3) is needed.
+        vm.prank(A.NFT_HOLDER);
+        nft.safeTransferFrom(A.NFT_HOLDER, keeper, A.NFT_INDEX, 1, "");
+        vm.prank(keeper);
+        nft.setApprovalForAll(address(harvester), true);
+
+        // Accrual: time alone grows every live strategy's surplus (see test_fork_accrual_warpAloneProducesYield),
+        // so no donation/simulated accrual is needed.
+        vm.warp(block.timestamp + ACCRUAL_WARP);
+        vm.roll(block.number + ACCRUAL_WARP / 12);
+    }
+
+    // ------------------------------------------------------------------ helpers
+
+    function unlockCallback(bytes calldata) external returns (bytes memory) {
+        require(msg.sender == address(pm), "not pm");
+        unlockCallbackHit = true;
+        return "";
+    }
+
+    function _none() internal pure returns (address[] memory) {
+        return new address[](0);
+    }
+
+    function _one(address a) internal pure returns (address[] memory l) {
+        l = new address[](1);
+        l[0] = a;
+    }
+
+    function _harvest(address[] memory exempt, uint256 minEthOut) internal returns (uint256) {
+        vm.prank(keeper, keeper);
+        return harvester.harvest(exempt, A.NFT_INDEX, minEthOut);
+    }
+
+    function _assertHarvesterEmpty() internal view {
+        assertEq(address(harvester).balance, 0, "harvester ETH");
+        assertEq(IERC20(A.USDC).balanceOf(address(harvester)), 0, "harvester USDC");
+        assertEq(IERC20(A.DOLA).balanceOf(address(harvester)), 0, "harvester DOLA");
+        assertEq(IERC20(A.USDE).balanceOf(address(harvester)), 0, "harvester USDe");
+        assertEq(IERC20(A.CRVUSD).balanceOf(address(harvester)), 0, "harvester crvUSD");
+        assertEq(IERC20(A.FRAX).balanceOf(address(harvester)), 0, "harvester FRAX");
+        address[] memory strategies = sya.getYieldStrategies();
+        for (uint256 i = 0; i < strategies.length; i++) {
+            address token = sya.strategyTokens(strategies[i]);
+            assertEq(IERC20(token).balanceOf(address(harvester)), 0, "harvester strategy token");
+        }
+        assertEq(nft.balanceOf(address(harvester), A.NFT_INDEX), 0, "harvester NFT");
+    }
+
+    // ------------------------------------------------------------------ addresses
+
+    function test_fork_addresses_verifiedOnFork() public {
+        address[13] memory withCode = [
+            A.SYA,
+            A.YS_USDC,
+            A.YS_USDE,
+            A.YS_DOLA,
+            A.NFT_MINTER,
+            A.USDE_AMM_ADAPTER,
+            A.USDC,
+            A.DOLA,
+            A.USDE,
+            A.CRVUSD,
+            A.CURVE_ROUTER_NG,
+            A.POOL_MANAGER,
+            A.V4_STATE_VIEW
+        ];
+        for (uint256 i = 0; i < withCode.length; i++) {
+            assertGt(withCode[i].code.length, 0, "address has no code");
+        }
+        assertEq(sya.rewardToken(), A.USDC, "rewardToken");
+        assertEq(sya.nftMinter(), A.NFT_MINTER, "nftMinter");
+        assertEq(A.NFT_HOLDER.code.length, 0, "NFT holder is an EOA");
+
+        // PoolManager is the v4 PoolManager: StateView points at it and `unlock` calls back the caller
+        assertEq(IStateView(A.V4_STATE_VIEW).poolManager(), A.POOL_MANAGER, "StateView.poolManager");
+        pm.unlock("");
+        assertTrue(unlockCallbackHit, "unlock did not call back");
+
+        uint256 rate = sya.getDiscountRate();
+        console2.log("live SYA discount rate (bps):", rate);
+        assertGt(rate, 0, "discount rate");
+        assertLt(rate, 10_000, "discount rate");
+    }
+
+    function test_fork_liveStrategies_everyNonRewardTokenHasRoute() public view {
+        address reward = sya.rewardToken();
+        address[] memory strategies = sya.getYieldStrategies();
+        assertEq(strategies.length, 3, "live strategy count differs from the address table");
+        uint256 routed;
+        for (uint256 i = 0; i < strategies.length; i++) {
+            address token = sya.strategyTokens(strategies[i]);
+            console2.log("strategy", strategies[i]);
+            console2.log("  delivers token", token);
+            if (token == reward) continue;
+            assertTrue(harvester.getRoute(token).configured, "non-reward strategy token without a route");
+            routed++;
+        }
+        assertEq(routed, 2, "USDe and DOLA routed");
+        assertEq(sya.strategyTokens(A.YS_USDC), A.USDC);
+        assertEq(sya.strategyTokens(A.YS_USDE), A.USDE);
+        assertEq(sya.strategyTokens(A.YS_DOLA), A.DOLA);
+    }
+
+    // ------------------------------------------------------------------ routes and pool key
+
+    function _quote(MainnetRoutes.Route memory r, uint256 amount) internal view returns (uint256) {
+        return ICurveRouterNGQuote(A.CURVE_ROUTER_NG).get_dy(r.path, r.swapParams, amount, r.pools);
+    }
+
+    function test_fork_routes_coinIndicesMatchPools() public view {
+        // USDe route: USDe -> crvUSD on 0xF55B..., crvUSD -> USDC on the discovered pool
+        MainnetRoutes.Route memory u = MainnetRoutes.usdeRoute();
+        assertEq(u.path[0], A.USDE);
+        assertEq(ICurvePoolCoins(u.path[1]).coins(u.swapParams[0][0]), A.USDE, "usde hop1 i");
+        assertEq(ICurvePoolCoins(u.path[1]).coins(u.swapParams[0][1]), A.CRVUSD, "usde hop1 j");
+        assertEq(u.path[1], 0xF55B0f6F2Da5ffDDb104b58a60F2862745960442, "usde hop1 pool");
+        assertEq(u.path[2], A.CRVUSD);
+        assertEq(ICurvePoolCoins(u.path[3]).coins(u.swapParams[1][0]), A.CRVUSD, "usde hop2 i");
+        assertEq(ICurvePoolCoins(u.path[3]).coins(u.swapParams[1][1]), A.USDC, "usde hop2 j");
+        assertEq(u.path[4], A.USDC);
+
+        // DOLA route: one exchange_underlying hop on the DOLA/FRAXBP metapool (DOLA=0, FRAX=1, USDC=2)
+        MainnetRoutes.Route memory d = MainnetRoutes.dolaRoute();
+        assertEq(d.path[0], A.DOLA);
+        assertEq(ICurvePoolCoins(d.path[1]).coins(0), A.DOLA, "dola meta coin0");
+        address basePool = ICurveMetaPool(d.path[1]).base_pool();
+        assertEq(ICurvePoolCoins(basePool).coins(0), A.FRAX, "FRAXBP coin0");
+        assertEq(ICurvePoolCoins(basePool).coins(1), A.USDC, "FRAXBP coin1 (underlying index 2)");
+        assertEq(d.swapParams[0][1], 2, "USDC underlying index");
+        assertEq(d.path[2], A.USDC);
+    }
+
+    function test_fork_routes_quoteCloseToPar() public view {
+        // 20 tokens is the size of a real harvest; 1000 tokens shows the route still has depth
+        uint256 u20 = _quote(MainnetRoutes.usdeRoute(), 20e18);
+        uint256 d20 = _quote(MainnetRoutes.dolaRoute(), 20e18);
+        uint256 d1000 = _quote(MainnetRoutes.dolaRoute(), 1000e18);
+        console2.log("20 USDe -> USDC (6dp)", u20);
+        console2.log("20 DOLA -> USDC (6dp)", d20);
+        console2.log("1000 DOLA -> USDC (6dp)", d1000);
+        assertGt(u20, 19.8e6, "USDe route quote");
+        assertGt(d20, 19.8e6, "DOLA route quote");
+        assertGt(d1000, 990e6, "DOLA route depth");
+    }
+
+    function test_fork_ethPool_isDeepestNativeEthUsdcPool() public view {
+        PoolKey memory chosen = MainnetRoutes.ethPoolKey();
+        assertEq(Currency.unwrap(chosen.currency0), address(0), "native ETH");
+        assertEq(Currency.unwrap(chosen.currency1), A.USDC, "USDC");
+        assertEq(address(chosen.hooks), address(0), "no hooks");
+        uint128 chosenL = pm.getLiquidity(chosen.toId());
+        assertGt(chosenL, 0, "chosen pool has liquidity");
+
+        uint24[4] memory fees = [uint24(100), 500, 3000, 10_000];
+        int24[4] memory spacings = [int24(1), 10, 60, 200];
+        for (uint256 i = 0; i < fees.length; i++) {
+            PoolKey memory k = PoolKey(Currency.wrap(address(0)), Currency.wrap(A.USDC), fees[i], spacings[i], IHooks(address(0)));
+            uint128 l = pm.getLiquidity(k.toId());
+            console2.log("fee", fees[i], "liquidity", l);
+            assertLe(l, chosenL, "a candidate pool is deeper than the chosen one");
+        }
+        assertEq(harvester.getEthPool().fee, chosen.fee, "harvester configured with chosen key");
+    }
+
+    // ------------------------------------------------------------------ accrual
+
+    function test_fork_accrual_warpAloneProducesYield() public view {
+        address[] memory strategies = sya.getYieldStrategies();
+        for (uint256 i = 0; i < strategies.length; i++) {
+            uint256 y = sya.getYield(strategies[i]);
+            console2.log("pending yield", strategies[i], y);
+            assertGt(y, 0, "strategy has no surplus after warp");
+        }
+        assertGt(sya.calculateClaimAmount(_none()), 0, "calculateClaimAmount");
+    }
+
+    // ------------------------------------------------------------------ end-to-end harvest
+
+    function test_fork_harvest_endToEnd_paysEthBurnsNftLeavesNoBalances() public {
+        uint256 keeperEthBefore = keeper.balance;
+        uint256 nftBefore = nft.balanceOf(keeper, A.NFT_INDEX);
+        uint256 supplyBefore = ITotalSupply1155(A.NFT_MINTER).totalSupply(A.NFT_INDEX);
+        console2.log("calculateClaimAmount (USDC 6dp)", sya.calculateClaimAmount(_none()));
+
+        vm.txGasPrice(GAS_PRICE);
+        uint256 ethOut = _harvest(_none(), 1);
+
+        console2.log("ETH paid to caller (wei)", ethOut);
+        assertGt(ethOut, 0, "no ETH");
+        assertEq(keeper.balance - keeperEthBefore, ethOut, "caller received ethOut");
+        assertEq(nft.balanceOf(keeper, A.NFT_INDEX), nftBefore - 1, "caller NFT unit");
+        assertEq(ITotalSupply1155(A.NFT_MINTER).totalSupply(A.NFT_INDEX), supplyBefore - 1, "NFT unit burned");
+        _assertHarvesterEmpty();
+    }
+
+    /// @notice The USDe strategy's skimSurplus (ERC4626Market: sUSDe -> USDe via CurveAMMAdapter -> Router NG)
+    ///         runs INSIDE the harvester's V4 unlock here. Any nested `poolManager.unlock` on that path would
+    ///         revert `AlreadyUnlocked`, so a successful harvest with the USDe strategy non-exempt proves the
+    ///         live strategy does not nest an unlock.
+    /// @dev Double fee (profitability only, not correctness): the skim's sUSDe -> USDe leg and the harvester's
+    ///      USDe -> crvUSD sale may both trade on pool 0xF55B0f6F2Da5ffDDb104b58a60F2862745960442 in this one
+    ///      transaction, paying that pool's fee twice and moving its price against the second trade.
+    function test_fork_harvest_usdeStrategyNonExempt_noNestedUnlock() public {
+        assertGt(sya.getYield(A.YS_USDE), 0, "USDe strategy has surplus, so skimSurplus moves tokens");
+        address[] memory exempt = new address[](2);
+        exempt[0] = A.YS_USDC;
+        exempt[1] = A.YS_DOLA;
+
+        vm.recordLogs();
+        uint256 ethOut = _harvest(exempt, 1);
+        assertGt(ethOut, 0, "USDe-only harvest paid ETH: no AlreadyUnlocked from a nested unlock");
+        _assertHarvesterEmpty();
+    }
+
+    function test_fork_harvest_eachStrategyExemptedInTurn() public {
+        address[] memory strategies = sya.getYieldStrategies();
+        for (uint256 i = 0; i < strategies.length; i++) {
+            uint256 snap = vm.snapshotState();
+            uint256 remaining = sya.calculateClaimAmount(_one(strategies[i]));
+            if (remaining == 0) {
+                // Exempting it leaves no yield: SYA reverts ZeroAmount inside the unlock
+                vm.expectRevert(IStableYieldAccumulator.ZeroAmount.selector);
+                _harvest(_one(strategies[i]), 0);
+            } else {
+                uint256 ethOut = _harvest(_one(strategies[i]), 1);
+                console2.log("exempt", strategies[i], "ethOut", ethOut);
+                assertGt(ethOut, 0, "harvest with one strategy exempt");
+                _assertHarvesterEmpty();
+            }
+            vm.revertToState(snap);
+        }
+    }
+
+    function test_fork_harvest_highGasPrice_revertsUnprofitable() public {
+        vm.txGasPrice(10_000 gwei);
+        vm.prank(keeper, keeper);
+        (bool ok, bytes memory ret) =
+            address(harvester).call(abi.encodeCall(harvester.harvest, (_none(), A.NFT_INDEX, 0)));
+        assertFalse(ok, "should revert");
+        assertEq(bytes4(ret), SYAHarvester.Unprofitable.selector, "Unprofitable");
+    }
+
+    function test_fork_harvest_excessiveMinEthOut_revertsInsufficientEthOut() public {
+        vm.prank(keeper, keeper);
+        (bool ok, bytes memory ret) =
+            address(harvester).call(abi.encodeCall(harvester.harvest, (_none(), A.NFT_INDEX, 1000 ether)));
+        assertFalse(ok, "should revert");
+        assertEq(bytes4(ret), SYAHarvester.InsufficientEthOut.selector, "InsufficientEthOut");
+    }
+
+    // ------------------------------------------------------------------ GAS_OVERHEAD calibration
+
+    function _calldataGas(bytes memory data) internal pure returns (uint256 g) {
+        for (uint256 i = 0; i < data.length; i++) {
+            g += data[i] == 0 ? 4 : 16;
+        }
+    }
+
+    /// @notice GAS_OVERHEAD must cover the gap between the gas check's in-contract estimate
+    ///         (`g0 - gasleft()` at the check) and the gas the transaction really burns.
+    /// @dev Real gas is approximated as 21000 intrinsic + calldata + the gas the call consumed measured
+    ///      around it here. That over-states a real transaction (the CALL into the harvester and the cold
+    ///      `to` account are charged here but are free/warm in a real tx, and SSTORE refunds are not
+    ///      deducted), so it is a conservative upper bound. The in-contract estimate comes from the
+    ///      `Unprofitable(ethOut, gasCost)` revert at a huge gas price: `gasCost / price - GAS_OVERHEAD`.
+    function test_fork_gasOverhead_coversMeasuredGap() public {
+        bytes memory data = abi.encodeCall(harvester.harvest, (_none(), A.NFT_INDEX, 0));
+
+        // 1) real gas of a successful harvest at a realistic gas price (measured first, cold)
+        uint256 snap = vm.snapshotState();
+        vm.txGasPrice(GAS_PRICE);
+        vm.prank(keeper, keeper);
+        uint256 before = gasleft();
+        (bool ok,) = address(harvester).call(data);
+        uint256 executionGas = before - gasleft();
+        assertTrue(ok, "harvest");
+        uint256 realGas = 21_000 + _calldataGas(data) + executionGas;
+        vm.revertToState(snap);
+
+        // 2) the in-contract estimate for the same harvest, read from the Unprofitable revert
+        uint256 price = 1_000_000 gwei;
+        vm.txGasPrice(price);
+        vm.prank(keeper, keeper);
+        bytes memory ret;
+        (ok, ret) = address(harvester).call(data);
+        assertFalse(ok, "expected Unprofitable");
+        assertEq(bytes4(ret), SYAHarvester.Unprofitable.selector);
+        uint256 gasCost;
+        assembly {
+            gasCost := mload(add(ret, 0x44))
+        }
+        uint256 inContract = gasCost / price - harvester.GAS_OVERHEAD();
+
+        uint256 gap = realGas - inContract;
+        console2.log("real gas (upper bound)", realGas);
+        console2.log("in-contract estimate", inContract);
+        console2.log("gap", gap);
+        console2.log("GAS_OVERHEAD", harvester.GAS_OVERHEAD());
+        assertGe(harvester.GAS_OVERHEAD(), gap, "GAS_OVERHEAD does not cover the measured gap");
+        // and is not wildly padded: within 25k gas of the measured gap
+        assertLe(harvester.GAS_OVERHEAD(), gap + 25_000, "GAS_OVERHEAD over-padded");
+    }
+}
