@@ -487,9 +487,8 @@ contract SYAHarvesterForkTest is Test, IUnlockCallback {
         address[5] memory pools;
         deal(A.USDE, address(this), amount);
         IERC20(A.USDE).approve(A.CURVE_ROUTER_NG, amount);
-        (ok, ret) = A.CURVE_ROUTER_NG.call(
-            abi.encodeCall(ICurveRouterNG.exchange, (path, params, amount, 0, pools, address(this)))
-        );
+        (ok, ret) = A.CURVE_ROUTER_NG
+            .call(abi.encodeCall(ICurveRouterNG.exchange, (path, params, amount, 0, pools, address(this))));
     }
 
     /// @dev Same call against `MockCurveRouter`, funded with every token the path could resolve to

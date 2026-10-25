@@ -86,6 +86,17 @@ contract SYAHarvester is Ownable, ERC1155Holder, IUnlockCallback {
     /// @dev Router NG stops at the first empty pool slot, so any later entry is never executed. Such a route
     ///      would deliver an intermediate token and strand it (audit 01, M-01).
     error InvalidRouteGap(uint256 index);
+    /// @notice A route's intermediate token slot `path[index]` is zero inside the prefix Curve Router NG executes
+    /// @dev `path[2i]` for some executed intermediate hop `0 < i < k`: hop i-1 would output `address(0)` and the
+    ///      real router reverts (audit 01, M-01 residual).
+    error InvalidRouteToken(uint256 index);
+    /// @notice A route's swap params row `hop` is inconsistent with its path
+    /// @dev Executed rows (`hop < k`) need a non-zero swap_type (`swapParams[hop][2]`); rows `hop >= k` are never
+    ///      read by Router NG and must be all zero (audit 01, mitigation 2).
+    error InvalidRouteSwapParams(uint256 hop);
+    /// @notice `pools[hop]` is non-zero for a hop Curve Router NG never executes (`hop >= k`)
+    /// @dev Audit 01, mitigation 2. Pools of executed hops are unconstrained (zap swap types use them).
+    error InvalidRoutePools(uint256 hop);
     /// @notice The pool key is not a native-ETH / reward-token pool
     error InvalidEthPool();
     /// @notice A non-exempt strategy delivered `token` but no route is registered for it
@@ -126,10 +137,16 @@ contract SYAHarvester is Ownable, ERC1155Holder, IUnlockCallback {
      * @param pools 5-slot `_pools` array for Curve Router NG
      * @dev Validates the route the way Curve Router NG executes it. Router NG runs hop k while the pool slot
      *      `path[2k+1]` is non-zero and delivers `path[2k]` at the first empty pool slot (`path[10]` after five
-     *      hops). Requires `path[0] == token`, that no non-zero entry follows that executed prefix
-     *      (`InvalidRouteGap`), and that the delivered token equals `sya.rewardToken()`, read at call time
-     *      (`InvalidRouteEnd`). A reward-token "route" with `path[1] == 0` is accepted; it is never executed
-     *      because `_sellYield` skips the reward token.
+     *      hops). With k the number of executed hops, checks in this order:
+     *      - `token != 0` (`ZeroAddress`) and `path[0] == token` (`InvalidRouteStart`);
+     *      - no non-zero entry follows the executed prefix, i.e. `path[2k+1..10]` are zero (`InvalidRouteGap`);
+     *      - every executed intermediate token `path[2i]`, `0 < i < k`, is non-zero (`InvalidRouteToken`);
+     *      - the delivered token `path[2k]` equals `sya.rewardToken()`, read at call time (`InvalidRouteEnd`);
+     *      - per hop h in order 0..4: an executed row (h < k) has `swapParams[h][2]` (swap_type) != 0, and an
+     *        unexecuted row (h >= k) is all zero (`InvalidRouteSwapParams`) with `pools[h] == 0`
+     *        (`InvalidRoutePools`). Pools of executed hops are not constrained.
+     *      A reward-token "route" with `path[1] == 0` (k = 0) and all-zero swap params and pools is accepted;
+     *      it is never executed because `_sellYield` skips the reward token.
      */
     function setRoute(
         address token,
@@ -147,9 +164,25 @@ contract SYAHarvester is Ownable, ERC1155Holder, IUnlockCallback {
         for (uint256 i = 2 * k + 1; i < 11; i++) {
             if (path[i] != address(0)) revert InvalidRouteGap(i);
         }
+        // Every executed intermediate token must exist: hop i-1 outputs path[2i].
+        for (uint256 i = 1; i < k; i++) {
+            if (path[2 * i] == address(0)) revert InvalidRouteToken(2 * i);
+        }
         address rewardToken = sya.rewardToken();
         address delivered = path[2 * k];
         if (delivered != rewardToken) revert InvalidRouteEnd(rewardToken, delivered);
+        // Swap params and pools must match the executed prefix: executed rows dispatch on a real swap_type,
+        // rows and pools the router never reads are zero.
+        for (uint256 h = 0; h < 5; h++) {
+            if (h < k) {
+                if (swapParams[h][2] == 0) revert InvalidRouteSwapParams(h);
+            } else {
+                for (uint256 f = 0; f < 5; f++) {
+                    if (swapParams[h][f] != 0) revert InvalidRouteSwapParams(h);
+                }
+                if (pools[h] != address(0)) revert InvalidRoutePools(h);
+            }
+        }
 
         CurveRoute storage r = routes[token];
         r.path = path;

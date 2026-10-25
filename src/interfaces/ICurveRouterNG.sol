@@ -17,6 +17,10 @@ pragma solidity ^0.8.13;
  *      delivers `_route[2k]` for the first k with `_route[2k+1] == 0` (or `_route[10]` after five hops).
  *      Any non-zero entry after that point is ignored, so the delivered token is NOT necessarily the last
  *      non-zero entry of `_route`.
+ *
+ *      Per hop: hop h reads row `_swap_params[h]` (dispatching on its `swap_type`, `_swap_params[h][2]`;
+ *      unknown types revert "Bad swap type") and `_pools[h]` (only for the zap swap types 3/5/7). Rows and
+ *      pools for hops h >= k, the ones never executed, are ignored by the router.
  */
 interface ICurveRouterNG {
     /**

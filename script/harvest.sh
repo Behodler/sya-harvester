@@ -161,6 +161,9 @@ KNOWN_ERRORS=(
   "InvalidRouteStart(address,address)"
   "InvalidRouteEnd(address,address)"
   "InvalidRouteGap(uint256)"
+  "InvalidRouteToken(uint256)"
+  "InvalidRouteSwapParams(uint256)"
+  "InvalidRoutePools(uint256)"
 )
 decode_revert() {
   local out="$1" data sel e esig args
