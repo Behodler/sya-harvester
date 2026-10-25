@@ -467,4 +467,104 @@ contract SYAHarvesterForkTest is Test, IUnlockCallback {
         assertEq(IERC20(A.CRVUSD).balanceOf(address(this)) - crvBefore, amount, "mock delivered crvUSD too");
         assertEq(IERC20(A.USDC).balanceOf(address(this)), usdcBefore, "mock delivered no USDC");
     }
+
+    // ------------------------------------------------------------------ audit 01: M-01 residual + mitigation 2
+
+    /// @dev USDe -> [USDe/crvUSD] -> address(0) -> [crvUSD/USDC] -> USDC: the executed prefix delivers USDC, but
+    ///      hop 0's output token slot is empty.
+    function _zeroIntermediatePath() internal pure returns (address[11] memory p) {
+        p[0] = A.USDE;
+        p[1] = MainnetRoutes.POOL_USDE_CRVUSD;
+        p[3] = MainnetRoutes.POOL_CRVUSD_USDC;
+        p[4] = A.USDC;
+    }
+
+    /// @dev Calls the REAL Router NG with `amount` USDe from this contract; returns success and revert data
+    function _realRouterExchange(address[11] memory path, uint256[5][5] memory params, uint256 amount)
+        internal
+        returns (bool ok, bytes memory ret)
+    {
+        address[5] memory pools;
+        deal(A.USDE, address(this), amount);
+        IERC20(A.USDE).approve(A.CURVE_ROUTER_NG, amount);
+        (ok, ret) = A.CURVE_ROUTER_NG.call(
+            abi.encodeCall(ICurveRouterNG.exchange, (path, params, amount, 0, pools, address(this)))
+        );
+    }
+
+    /// @dev Same call against `MockCurveRouter`, funded with every token the path could resolve to
+    function _mockExchange(address[11] memory path, uint256[5][5] memory params, uint256 amount)
+        internal
+        returns (bool ok, bytes memory ret)
+    {
+        address[5] memory pools;
+        MockCurveRouter mock = new MockCurveRouter();
+        mock.setRate(A.USDE, 1e18);
+        deal(A.CRVUSD, address(mock), amount);
+        deal(A.USDC, address(mock), amount);
+        deal(A.USDE, address(this), amount);
+        IERC20(A.USDE).approve(address(mock), amount);
+        (ok, ret) = address(mock).call(abi.encodeCall(mock.exchange, (path, params, amount, 0, pools, address(this))));
+    }
+
+    /// @notice Ground truth: the real Router NG REVERTS (empty revert data) on a zero intermediate token inside
+    ///         the executed prefix, and the mock reverts too.
+    function test_fork_zeroIntermediate_realRouterReverts_mockAgrees() public {
+        MainnetRoutes.Route memory u = MainnetRoutes.usdeRoute();
+        uint256 usdcBefore = IERC20(A.USDC).balanceOf(address(this));
+
+        (bool ok, bytes memory ret) = _realRouterExchange(_zeroIntermediatePath(), u.swapParams, 1_000e18);
+        console2.log("real Router NG, zero intermediate: reverted =", !ok);
+        console2.logBytes(ret);
+        assertFalse(ok, "real Router NG reverts on a zero intermediate token");
+        // observed at PINNED_BLOCK: empty revert data (a call to the code-less address(0) as the hop-0 output token)
+        assertEq(ret.length, 0, "real Router NG revert data is empty");
+        assertEq(IERC20(A.USDC).balanceOf(address(this)), usdcBefore, "no USDC delivered");
+
+        (ok, ret) = _mockExchange(_zeroIntermediatePath(), u.swapParams, 1_000e18);
+        assertFalse(ok, "mock reverts too");
+        assertEq(ret, abi.encodeWithSignature("ZeroIntermediateToken()"));
+    }
+
+    /// @notice Ground truth: the real Router NG REVERTS `Error("Bad swap type")` when an executed hop's swap_type
+    ///         is 0, and the mock reverts too.
+    function test_fork_zeroSwapTypeOnExecutedHop_realRouterReverts_mockAgrees() public {
+        MainnetRoutes.Route memory u = MainnetRoutes.usdeRoute();
+        uint256[5][5] memory params = u.swapParams;
+        params[1][2] = 0; // hop 1 (crvUSD -> USDC) executed with swap_type 0
+
+        (bool ok, bytes memory ret) = _realRouterExchange(u.path, params, 1_000e18);
+        console2.log("real Router NG, swap_type 0 on hop 1: reverted =", !ok);
+        console2.logBytes(ret);
+        assertFalse(ok, "real Router NG reverts on swap_type 0 for an executed hop");
+        // observed at PINNED_BLOCK: Router NG's own dispatch rejects the unknown swap type
+        assertEq(ret, abi.encodeWithSignature("Error(string)", "Bad swap type"), "real Router NG: Bad swap type");
+
+        (ok, ret) = _mockExchange(u.path, params, 1_000e18);
+        assertFalse(ok, "mock reverts too");
+        assertEq(ret, abi.encodeWithSignature("BadSwapType(uint256)", 1));
+    }
+
+    function test_fork_zeroIntermediate_rejectedBySetRoute() public {
+        MainnetRoutes.Route memory u = MainnetRoutes.usdeRoute();
+        vm.prank(owner);
+        vm.expectRevert(abi.encodeWithSignature("InvalidRouteToken(uint256)", 2));
+        harvester.setRoute(A.USDE, _zeroIntermediatePath(), u.swapParams, u.pools);
+
+        SYAHarvester.CurveRoute memory r = harvester.getRoute(A.USDE);
+        assertEq(r.path[2], A.CRVUSD, "shipped route kept");
+    }
+
+    /// @notice The shipped routes satisfy every setRoute rule (configure re-runs cleanly) and still harvest
+    ///         to an empty harvester.
+    function test_fork_shippedRoutes_passNewRules_andHarvestLeavesHarvesterEmpty() public {
+        vm.startPrank(owner);
+        MainnetRoutes.configure(harvester);
+        vm.stopPrank();
+
+        vm.txGasPrice(0);
+        uint256 ethOut = _harvest(_none(), 0);
+        assertGt(ethOut, 0, "harvest paid ETH");
+        _assertHarvesterEmpty();
+    }
 }

@@ -69,6 +69,20 @@ contract SYAHarvesterRegistryTest is Test {
         pools[0] = pool1;
     }
 
+    /// @dev Swap params consistent with a route executing `k` hops: rows 0..k-1 carry a non-zero swap_type
+    ///      (rows 0 and 1 are exactly `_params()`), rows k..4 are all zero (audit 01, mitigation 2).
+    function _params(uint256 k) internal pure returns (uint256[5][5] memory p) {
+        for (uint256 h = 0; h < k; h++) {
+            p[h] = h == 1 ? [uint256(1), 0, 1, 10, 2] : [uint256(0), 1, 1, 1, 2];
+        }
+    }
+
+    /// @dev Pools consistent with a route executing `k` hops: `pools[0] = pool1` is legal for an executed hop
+    ///      (k >= 1); every slot k..4 is zero.
+    function _pools(uint256 k) internal view returns (address[5] memory pools) {
+        if (k >= 1) pools[0] = pool1;
+    }
+
     function _ethKey() internal view returns (PoolKey memory) {
         return PoolKey({
             currency0: Currency.wrap(address(0)),
@@ -264,7 +278,7 @@ contract SYAHarvesterRegistryTest is Test {
     function test_setRoute_storesFullFiveHopRoute() public {
         address[11] memory path = _fiveHop(usde, usdc);
         vm.prank(owner);
-        harvester.setRoute(usde, path, _params(), _pools());
+        harvester.setRoute(usde, path, _params(5), _pools(5));
 
         SYAHarvester.CurveRoute memory r = harvester.getRoute(usde);
         assertTrue(r.configured);
@@ -277,7 +291,7 @@ contract SYAHarvesterRegistryTest is Test {
         address[11] memory path = _fiveHop(usde, other);
         vm.prank(owner);
         vm.expectRevert(abi.encodeWithSelector(SYAHarvester.InvalidRouteEnd.selector, usdc, other));
-        harvester.setRoute(usde, path, _params(), _pools());
+        harvester.setRoute(usde, path, _params(5), _pools(5));
     }
 
     function test_setRoute_rejectsNoHopRouteForNonRewardToken() public {
@@ -305,7 +319,7 @@ contract SYAHarvesterRegistryTest is Test {
         address[11] memory path;
         path[0] = usdc;
         vm.prank(owner);
-        harvester.setRoute(usdc, path, _params(), _pools());
+        harvester.setRoute(usdc, path, _params(0), _pools(0));
 
         SYAHarvester.CurveRoute memory r = harvester.getRoute(usdc);
         assertTrue(r.configured);
@@ -331,8 +345,8 @@ contract SYAHarvesterRegistryTest is Test {
 
     function test_setRoute_storesSingleHop() public {
         address[11] memory path = _singleHop(usde);
-        uint256[5][5] memory params = _params();
-        address[5] memory pools = _pools();
+        uint256[5][5] memory params = _params(1);
+        address[5] memory pools = _pools(1);
 
         vm.prank(owner);
         harvester.setRoute(usde, path, params, pools);
@@ -369,7 +383,194 @@ contract SYAHarvesterRegistryTest is Test {
         vm.expectEmit(true, false, false, true, address(harvester));
         emit RouteSet(usde);
         vm.prank(owner);
-        harvester.setRoute(usde, _singleHop(usde), _params(), _pools());
+        harvester.setRoute(usde, _singleHop(usde), _params(1), _pools(1));
+    }
+
+    /*//////////////////////////////////////////////////////////////
+        ROUTE TOKEN / SWAP PARAMS / POOLS CONSISTENCY (audit 01, M-01 residual + mitigation 2)
+    //////////////////////////////////////////////////////////////*/
+
+    function test_setRoute_rejectsZeroIntermediateToken_twoHop() public {
+        // [usde, pool0, 0, pool1, usdc, 0...]: the executed prefix delivers usdc but hop 0 outputs address(0)
+        address[11] memory path;
+        path[0] = usde;
+        path[1] = pool0;
+        path[3] = pool1;
+        path[4] = usdc;
+        vm.prank(owner);
+        vm.expectRevert(abi.encodeWithSignature("InvalidRouteToken(uint256)", 2));
+        harvester.setRoute(usde, path, _params(2), _pools(2));
+    }
+
+    function test_setRoute_rejectsZeroIntermediateToken_index6InFourHop() public {
+        address[11] memory path;
+        path[0] = usde;
+        path[1] = pool0;
+        path[2] = other;
+        path[3] = pool1;
+        path[4] = dola;
+        path[5] = pool0;
+        // path[6] == 0: hop 2 outputs address(0)
+        path[7] = pool1;
+        path[8] = usdc;
+        vm.prank(owner);
+        vm.expectRevert(abi.encodeWithSignature("InvalidRouteToken(uint256)", 6));
+        harvester.setRoute(usde, path, _params(4), _pools(4));
+    }
+
+    function test_setRoute_zeroIntermediateReportedBeforeWrongEnd() public {
+        address[11] memory path = _multiHop(usde);
+        path[2] = address(0);
+        path[4] = other; // also delivers a non-reward token: the zero intermediate is reported first
+        vm.prank(owner);
+        vm.expectRevert(abi.encodeWithSignature("InvalidRouteToken(uint256)", 2));
+        harvester.setRoute(usde, path, _params(2), _pools(2));
+    }
+
+    function test_setRoute_rejectsExecutedRowWithZeroSwapType_singleHop() public {
+        uint256[5][5] memory p = _params(1);
+        p[0][2] = 0;
+        vm.prank(owner);
+        vm.expectRevert(abi.encodeWithSignature("InvalidRouteSwapParams(uint256)", 0));
+        harvester.setRoute(usde, _singleHop(usde), p, _pools(1));
+    }
+
+    function test_setRoute_rejectsExecutedRowWithZeroSwapType_secondHop() public {
+        uint256[5][5] memory p = _params(2);
+        p[1][2] = 0; // i/j/pool_type/n_coins still set: only swap_type decides "executed row non-empty"
+        vm.prank(owner);
+        vm.expectRevert(abi.encodeWithSignature("InvalidRouteSwapParams(uint256)", 1));
+        harvester.setRoute(usde, _multiHop(usde), p, _pools(2));
+    }
+
+    function test_setRoute_rejectsAllZeroExecutedRow_fiveHop() public {
+        uint256[5][5] memory p = _params(5);
+        delete p[4];
+        vm.prank(owner);
+        vm.expectRevert(abi.encodeWithSignature("InvalidRouteSwapParams(uint256)", 4));
+        harvester.setRoute(usde, _fiveHop(usde, usdc), p, _pools(5));
+    }
+
+    function test_setRoute_rejectsRowAtHopK_singleHop() public {
+        // single-hop with row 1 set (the old two-row `_params()`): row 1 is never executed
+        vm.prank(owner);
+        vm.expectRevert(abi.encodeWithSignature("InvalidRouteSwapParams(uint256)", 1));
+        harvester.setRoute(usde, _singleHop(usde), _params(), _pools(1));
+    }
+
+    function test_setRoute_rejectsSingleNonZeroFieldInUnexecutedRow() public {
+        // a non-executed row with only its `i` field set is still non-zero
+        uint256[5][5] memory p = _params(1);
+        p[3][0] = 1;
+        vm.prank(owner);
+        vm.expectRevert(abi.encodeWithSignature("InvalidRouteSwapParams(uint256)", 3));
+        harvester.setRoute(usde, _singleHop(usde), p, _pools(1));
+    }
+
+    function test_setRoute_rejectsPoolAtHopK_singleHop() public {
+        address[5] memory pools = _pools(1);
+        pools[1] = pool1;
+        vm.prank(owner);
+        vm.expectRevert(abi.encodeWithSignature("InvalidRoutePools(uint256)", 1));
+        harvester.setRoute(usde, _singleHop(usde), _params(1), pools);
+    }
+
+    function test_setRoute_rejectsPoolInLastSlot_twoHop() public {
+        address[5] memory pools = _pools(2);
+        pools[4] = pool0;
+        vm.prank(owner);
+        vm.expectRevert(abi.encodeWithSignature("InvalidRoutePools(uint256)", 4));
+        harvester.setRoute(usde, _multiHop(usde), _params(2), pools);
+    }
+
+    function test_setRoute_unexecutedHopChecksParamsBeforePools() public {
+        // hop 1 (k = 1) has both a stray row and a stray pool: the row is reported
+        address[5] memory pools = _pools(1);
+        pools[1] = pool1;
+        vm.prank(owner);
+        vm.expectRevert(abi.encodeWithSignature("InvalidRouteSwapParams(uint256)", 1));
+        harvester.setRoute(usde, _singleHop(usde), _params(), pools);
+    }
+
+    function test_setRoute_unexecutedHopsAreCheckedInHopOrder() public {
+        // stray pool at hop 1 and stray row at hop 2 (k = 1): hop 1 is checked first
+        uint256[5][5] memory p = _params(1);
+        p[2][2] = 1;
+        address[5] memory pools = _pools(1);
+        pools[1] = pool1;
+        vm.prank(owner);
+        vm.expectRevert(abi.encodeWithSignature("InvalidRoutePools(uint256)", 1));
+        harvester.setRoute(usde, _singleHop(usde), p, pools);
+    }
+
+    function test_setRoute_wrongEndReportedBeforeSwapParams() public {
+        address[11] memory path = _singleHop(usde);
+        path[2] = other;
+        vm.prank(owner);
+        vm.expectRevert(abi.encodeWithSelector(SYAHarvester.InvalidRouteEnd.selector, usdc, other));
+        harvester.setRoute(usde, path, _params(), _pools());
+    }
+
+    function test_setRoute_rejectsNoHopRewardRouteWithNonZeroRow() public {
+        address[11] memory path;
+        path[0] = usdc;
+        vm.prank(owner);
+        vm.expectRevert(abi.encodeWithSignature("InvalidRouteSwapParams(uint256)", 0));
+        harvester.setRoute(usdc, path, _params(1), _pools(0));
+    }
+
+    function test_setRoute_rejectsNoHopRewardRouteWithNonZeroPool() public {
+        address[11] memory path;
+        path[0] = usdc;
+        vm.prank(owner);
+        vm.expectRevert(abi.encodeWithSignature("InvalidRoutePools(uint256)", 0));
+        harvester.setRoute(usdc, path, _params(0), _pools(1));
+    }
+
+    function test_setRoute_storesFullFiveHopRouteWithFiveValidRows() public {
+        address[11] memory path = _fiveHop(usde, usdc);
+        uint256[5][5] memory p = _params(5);
+        vm.prank(owner);
+        harvester.setRoute(usde, path, p, _pools(5));
+
+        SYAHarvester.CurveRoute memory r = harvester.getRoute(usde);
+        assertTrue(r.configured);
+        for (uint256 h = 0; h < 5; h++) {
+            assertGt(r.swapParams[h][2], 0, "executed row has a swap type");
+            for (uint256 f = 0; f < 5; f++) {
+                assertEq(r.swapParams[h][f], p[h][f]);
+            }
+        }
+    }
+
+    function test_setRoute_storesSingleHopWithOnlyRowZeroAndZeroPools() public {
+        address[11] memory path = _singleHop(usde);
+        uint256[5][5] memory p = _params(1);
+        address[5] memory pools;
+        vm.prank(owner);
+        harvester.setRoute(usde, path, p, pools);
+
+        SYAHarvester.CurveRoute memory r = harvester.getRoute(usde);
+        assertTrue(r.configured);
+        for (uint256 i = 0; i < 11; i++) {
+            assertEq(r.path[i], path[i]);
+        }
+        for (uint256 h = 0; h < 5; h++) {
+            assertEq(r.pools[h], address(0));
+            for (uint256 f = 0; f < 5; f++) {
+                assertEq(r.swapParams[h][f], p[h][f]);
+            }
+        }
+    }
+
+    function test_setRoute_acceptsNoHopRewardRouteWithAllZeroParamsAndPools() public {
+        address[11] memory path;
+        path[0] = usdc;
+        uint256[5][5] memory p;
+        address[5] memory pools;
+        vm.prank(owner);
+        harvester.setRoute(usdc, path, p, pools);
+        assertTrue(harvester.getRoute(usdc).configured);
     }
 
     function test_getRoute_unsetTokenIsNotConfigured() public view {
@@ -384,7 +585,7 @@ contract SYAHarvesterRegistryTest is Test {
 
     function test_clearRoute_resetsConfiguredAndEmits() public {
         vm.prank(owner);
-        harvester.setRoute(usde, _singleHop(usde), _params(), _pools());
+        harvester.setRoute(usde, _singleHop(usde), _params(1), _pools(1));
 
         vm.expectEmit(true, false, false, true, address(harvester));
         emit RouteCleared(usde);

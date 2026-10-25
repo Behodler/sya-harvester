@@ -46,10 +46,16 @@ contract MockCurveRouterTest is Test {
         tokenIn.approve(address(router), type(uint256).max);
     }
 
+    /// @dev Valid swap params for the hops Router NG executes on `path` (swap_type 1 = exchange), zero elsewhere
+    function _rows(address[11] memory path) internal pure returns (uint256[5][5] memory params) {
+        for (uint256 h = 0; h < 5 && path[2 * h + 1] != address(0); h++) {
+            params[h] = [uint256(0), 1, 1, 1, 2];
+        }
+    }
+
     function _exchange(address[11] memory path) internal returns (uint256) {
-        uint256[5][5] memory params;
         address[5] memory pools;
-        return router.exchange(path, params, AMOUNT, 0, pools, receiver);
+        return router.exchange(path, _rows(path), AMOUNT, 0, pools, receiver);
     }
 
     function test_exchange_contiguousRoute_deliversFinalToken() public {
@@ -144,10 +150,64 @@ contract MockCurveRouterTest is Test {
         path[0] = address(tokenIn);
         path[1] = pool0;
         path[2] = address(tokenOut);
-        uint256[5][5] memory params;
         address[5] memory pools;
 
         vm.expectRevert(abi.encodeWithSelector(MockCurveRouter.Slippage.selector, AMOUNT, AMOUNT + 1));
-        router.exchange(path, params, AMOUNT, AMOUNT + 1, pools, receiver);
+        router.exchange(path, _rows(path), AMOUNT, AMOUNT + 1, pools, receiver);
+    }
+
+    function test_exchange_zeroIntermediateToken_reverts() public {
+        // [in, pool0, 0, pool1, out, 0...]: hop 0 would output address(0)
+        address[11] memory path;
+        path[0] = address(tokenIn);
+        path[1] = pool0;
+        path[3] = pool1;
+        path[4] = address(tokenOut);
+
+        vm.expectRevert(abi.encodeWithSignature("ZeroIntermediateToken()"));
+        _exchange(path);
+    }
+
+    function test_resolveOutput_zeroIntermediateToken_reverts() public {
+        address[11] memory path;
+        path[0] = address(tokenIn);
+        path[1] = pool0;
+        path[2] = address(mid);
+        path[3] = pool1;
+        path[5] = pool0; // path[4] == 0 inside the executed prefix (k = 3)
+        path[6] = address(tokenOut);
+
+        vm.expectRevert(abi.encodeWithSignature("ZeroIntermediateToken()"));
+        router.resolveOutput(path);
+    }
+
+    function test_exchange_executedRowWithZeroSwapType_reverts() public {
+        address[11] memory path;
+        path[0] = address(tokenIn);
+        path[1] = pool0;
+        path[2] = address(mid);
+        path[3] = pool1;
+        path[4] = address(tokenOut);
+        uint256[5][5] memory params = _rows(path);
+        params[1][2] = 0;
+        address[5] memory pools;
+
+        vm.expectRevert(abi.encodeWithSignature("BadSwapType(uint256)", 1));
+        router.exchange(path, params, AMOUNT, 0, pools, receiver);
+    }
+
+    function test_exchange_ignoresRowsBeyondExecutedPrefix() public {
+        // the real router never reads rows k..4; rejecting them is setRoute's job, not the router's
+        address[11] memory path;
+        path[0] = address(tokenIn);
+        path[1] = pool0;
+        path[2] = address(tokenOut);
+        uint256[5][5] memory params = _rows(path);
+        params[3] = [uint256(7), 7, 7, 7, 7];
+        address[5] memory pools;
+        pools[4] = pool1;
+
+        router.exchange(path, params, AMOUNT, 0, pools, receiver);
+        assertEq(tokenOut.balanceOf(receiver), AMOUNT);
     }
 }
