@@ -160,6 +160,7 @@ KNOWN_ERRORS=(
   "InvalidEthPool()"
   "InvalidRouteStart(address,address)"
   "InvalidRouteEnd(address,address)"
+  "InvalidRouteGap(uint256)"
 )
 decode_revert() {
   local out="$1" data sel e esig args

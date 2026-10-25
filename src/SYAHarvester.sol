@@ -78,8 +78,14 @@ contract SYAHarvester is Ownable, ERC1155Holder, IUnlockCallback {
     error ZeroAddress();
     /// @notice `path[0]` of a route does not equal the token it is registered for
     error InvalidRouteStart(address token, address first);
-    /// @notice The last non-zero entry of a route's path is not SYA's reward token
-    error InvalidRouteEnd(address expected, address last);
+    /// @notice The token Curve Router NG would deliver for a route is not SYA's reward token
+    /// @dev Router NG executes hop k while `path[2k+1] != 0` and delivers `path[2k]` at the first empty pool
+    ///      slot (`path[10]` after five hops); `delivered` is that token, not the path's last non-zero entry.
+    error InvalidRouteEnd(address expected, address delivered);
+    /// @notice A route has a non-zero entry at `index`, after the prefix Curve Router NG actually executes
+    /// @dev Router NG stops at the first empty pool slot, so any later entry is never executed. Such a route
+    ///      would deliver an intermediate token and strand it (audit 01, M-01).
+    error InvalidRouteGap(uint256 index);
     /// @notice The pool key is not a native-ETH / reward-token pool
     error InvalidEthPool();
     /// @notice A non-exempt strategy delivered `token` but no route is registered for it
@@ -118,8 +124,12 @@ contract SYAHarvester is Ownable, ERC1155Holder, IUnlockCallback {
      * @param path 11-slot `_route` array for Curve Router NG
      * @param swapParams 5x5 `_swap_params` matrix for Curve Router NG
      * @param pools 5-slot `_pools` array for Curve Router NG
-     * @dev Requires `path[0] == token` and that the last non-zero entry of `path` equals
-     *      `sya.rewardToken()`, read at call time.
+     * @dev Validates the route the way Curve Router NG executes it. Router NG runs hop k while the pool slot
+     *      `path[2k+1]` is non-zero and delivers `path[2k]` at the first empty pool slot (`path[10]` after five
+     *      hops). Requires `path[0] == token`, that no non-zero entry follows that executed prefix
+     *      (`InvalidRouteGap`), and that the delivered token equals `sya.rewardToken()`, read at call time
+     *      (`InvalidRouteEnd`). A reward-token "route" with `path[1] == 0` is accepted; it is never executed
+     *      because `_sellYield` skips the reward token.
      */
     function setRoute(
         address token,
@@ -130,14 +140,16 @@ contract SYAHarvester is Ownable, ERC1155Holder, IUnlockCallback {
         if (token == address(0)) revert ZeroAddress();
         if (path[0] != token) revert InvalidRouteStart(token, path[0]);
 
-        address last;
-        for (uint256 i = 0; i < 11; i++) {
-            if (path[i] != address(0)) {
-                last = path[i];
-            }
+        // Router NG executes hop k while path[2k+1] != 0 and delivers path[2k] at the first empty pool slot.
+        uint256 k;
+        while (k < 5 && path[2 * k + 1] != address(0)) k++;
+        // Nothing may follow the executed prefix: a trailing entry is never executed (empty when k == 5).
+        for (uint256 i = 2 * k + 1; i < 11; i++) {
+            if (path[i] != address(0)) revert InvalidRouteGap(i);
         }
         address rewardToken = sya.rewardToken();
-        if (last != rewardToken) revert InvalidRouteEnd(rewardToken, last);
+        address delivered = path[2 * k];
+        if (delivered != rewardToken) revert InvalidRouteEnd(rewardToken, delivered);
 
         CurveRoute storage r = routes[token];
         r.path = path;

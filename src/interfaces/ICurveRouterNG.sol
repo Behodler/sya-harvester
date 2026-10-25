@@ -12,6 +12,11 @@ pragma solidity ^0.8.13;
  *      The 11-slot `_route` array interleaves tokens and pools:
  *        [tokenIn, pool0, token1, pool1, token2, ..., tokenOut, 0x0, ...]
  *      padded to 11 slots with zero addresses.
+ *
+ *      Execution stops at the FIRST empty pool slot: hop k runs while `_route[2k+1] != 0`, and the router
+ *      delivers `_route[2k]` for the first k with `_route[2k+1] == 0` (or `_route[10]` after five hops).
+ *      Any non-zero entry after that point is ignored, so the delivered token is NOT necessarily the last
+ *      non-zero entry of `_route`.
  */
 interface ICurveRouterNG {
     /**

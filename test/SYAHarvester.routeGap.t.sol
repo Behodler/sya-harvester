@@ -40,11 +40,12 @@ contract SYAHarvesterRouteGapTest is HarvesterFixture {
 
     function test_routeGap_mockDeliversIntermediateForGappedPath() public {
         // What the stored gapped route would have done inside harvest: the router pays crvUSD, not USDC
+        address receiver = makeAddr("receiver");
         usde.mint(address(this), 100e18);
         usde.approve(address(router), 100e18);
-        router.exchange(_gapPath(), _params(), 100e18, 0, _pools(), address(this));
-        assertGt(crvusd.balanceOf(address(this)), 0, "intermediate delivered");
-        assertEq(usdc.balanceOf(address(this)), 0, "reward token not delivered");
+        router.exchange(_gapPath(), _params(), 100e18, 0, _pools(), receiver);
+        assertGt(crvusd.balanceOf(receiver), 0, "intermediate delivered");
+        assertEq(usdc.balanceOf(receiver), 0, "reward token not delivered");
     }
 
     function test_routeGap_contiguousFixtureRoute_harvestLeavesNoBalances() public {
