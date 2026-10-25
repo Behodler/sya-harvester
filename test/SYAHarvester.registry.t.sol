@@ -30,6 +30,8 @@ contract SYAHarvesterRegistryTest is Test {
     address internal usde = makeAddr("usde");
     address internal dola = makeAddr("dola");
     address internal other = makeAddr("other");
+    address internal other2 = makeAddr("other2");
+    address internal other3 = makeAddr("other3");
     address internal pool0 = makeAddr("pool0");
     address internal pool1 = makeAddr("pool1");
 
@@ -167,6 +169,157 @@ contract SYAHarvesterRegistryTest is Test {
         vm.prank(owner);
         vm.expectRevert(abi.encodeWithSelector(SYAHarvester.InvalidRouteEnd.selector, usdc, dola));
         harvester.setRoute(usde, path, _params(), _pools());
+    }
+
+    /*//////////////////////////////////////////////////////////////
+               ROUTER NG CONTIGUITY (audit 01, M-01)
+    //////////////////////////////////////////////////////////////*/
+
+    /// @dev Router NG executes hop k while `path[2k+1] != 0` and delivers `path[2k]` at the first empty
+    ///      pool slot, so these entries are what the route actually does.
+    function _fiveHop(address tokenIn, address tokenOut) internal view returns (address[11] memory path) {
+        path[0] = tokenIn;
+        path[1] = pool0;
+        path[2] = other;
+        path[3] = pool1;
+        path[4] = dola;
+        path[5] = pool0;
+        path[6] = other2;
+        path[7] = pool1;
+        path[8] = other3;
+        path[9] = pool0;
+        path[10] = tokenOut;
+    }
+
+    function test_setRoute_rejectsGappedRoute_trailingRewardToken() public {
+        // The audit's mis-entered route: Router NG stops at path[3] == 0 and delivers `other`; the trailing
+        // reward token at path[10] is never reached. The gap is reported first (it is the root cause).
+        address[11] memory path;
+        path[0] = usde;
+        path[1] = pool0;
+        path[2] = other;
+        path[10] = usdc;
+        vm.prank(owner);
+        vm.expectRevert(abi.encodeWithSignature("InvalidRouteGap(uint256)", 10));
+        harvester.setRoute(usde, path, _params(), _pools());
+    }
+
+    function test_setRoute_rejectsGappedRoute_whenDeliveredIsRewardButTrailingEntry() public {
+        // The executed prefix already ends at the reward token; a duplicate trailing reward entry is still
+        // a non-executed entry and is rejected.
+        address[11] memory path;
+        path[0] = usde;
+        path[1] = pool0;
+        path[2] = usdc;
+        path[10] = usdc;
+        vm.prank(owner);
+        vm.expectRevert(abi.encodeWithSignature("InvalidRouteGap(uint256)", 10));
+        harvester.setRoute(usde, path, _params(), _pools());
+    }
+
+    function test_setRoute_rejectsStrayEntryAfterRewardToken() public {
+        address[11] memory path = _singleHop(usde);
+        path[4] = other; // never executed: path[3] == 0 ends the route at path[2]
+        vm.prank(owner);
+        vm.expectRevert(abi.encodeWithSignature("InvalidRouteGap(uint256)", 4));
+        harvester.setRoute(usde, path, _params(), _pools());
+    }
+
+    function test_setRoute_rejectsGapInMultiHopRoute() public {
+        address[11] memory path;
+        path[0] = usde;
+        path[1] = pool0;
+        path[2] = other;
+        path[3] = pool1;
+        path[4] = usdc;
+        path[6] = usdc; // path[5] == 0: the route ends at path[4]; path[6] is a trailing entry
+        vm.prank(owner);
+        vm.expectRevert(abi.encodeWithSignature("InvalidRouteGap(uint256)", 6));
+        harvester.setRoute(usde, path, _params(), _pools());
+    }
+
+    function test_setRoute_rejectsGapInMultiHopRoute_deliveringIntermediate() public {
+        // [usde, pool0, other, pool1, other2, 0, usdc, 0...]: Router NG delivers `other2` (path[4]); the
+        // trailing reward token at path[6] is never reached.
+        address[11] memory path;
+        path[0] = usde;
+        path[1] = pool0;
+        path[2] = other;
+        path[3] = pool1;
+        path[4] = other2;
+        path[6] = usdc;
+        vm.prank(owner);
+        vm.expectRevert(abi.encodeWithSignature("InvalidRouteGap(uint256)", 6));
+        harvester.setRoute(usde, path, _params(), _pools());
+    }
+
+    function test_setRoute_rejectsTrailingPoolSlotAfterRewardToken() public {
+        address[11] memory path = _singleHop(usde);
+        path[5] = pool1; // a pool slot after the executed prefix is still a trailing entry
+        vm.prank(owner);
+        vm.expectRevert(abi.encodeWithSignature("InvalidRouteGap(uint256)", 5));
+        harvester.setRoute(usde, path, _params(), _pools());
+    }
+
+    function test_setRoute_storesFullFiveHopRoute() public {
+        address[11] memory path = _fiveHop(usde, usdc);
+        vm.prank(owner);
+        harvester.setRoute(usde, path, _params(), _pools());
+
+        SYAHarvester.CurveRoute memory r = harvester.getRoute(usde);
+        assertTrue(r.configured);
+        for (uint256 i = 0; i < 11; i++) {
+            assertEq(r.path[i], path[i]);
+        }
+    }
+
+    function test_setRoute_rejectsFiveHopEndingAtNonRewardToken() public {
+        address[11] memory path = _fiveHop(usde, other);
+        vm.prank(owner);
+        vm.expectRevert(abi.encodeWithSelector(SYAHarvester.InvalidRouteEnd.selector, usdc, other));
+        harvester.setRoute(usde, path, _params(), _pools());
+    }
+
+    function test_setRoute_rejectsNoHopRouteForNonRewardToken() public {
+        // path[1] == 0: Router NG executes nothing; the "delivered" token is path[0] itself
+        address[11] memory path;
+        path[0] = usde;
+        vm.prank(owner);
+        vm.expectRevert(abi.encodeWithSelector(SYAHarvester.InvalidRouteEnd.selector, usdc, usde));
+        harvester.setRoute(usde, path, _params(), _pools());
+    }
+
+    function test_setRoute_rejectsNoHopRouteWithTrailingRewardToken() public {
+        // path[1] == 0 with a trailing reward token: nothing executes, path[2] is a trailing entry
+        address[11] memory path;
+        path[0] = usde;
+        path[2] = usdc;
+        vm.prank(owner);
+        vm.expectRevert(abi.encodeWithSignature("InvalidRouteGap(uint256)", 2));
+        harvester.setRoute(usde, path, _params(), _pools());
+    }
+
+    /// @dev Documented harmless case: a reward-token "route" with no hop (k = 0) delivers path[0] = reward.
+    ///      `_sellYield` skips the reward token, so this route is never executed.
+    function test_setRoute_acceptsNoHopRouteForRewardToken() public {
+        address[11] memory path;
+        path[0] = usdc;
+        vm.prank(owner);
+        harvester.setRoute(usdc, path, _params(), _pools());
+
+        SYAHarvester.CurveRoute memory r = harvester.getRoute(usdc);
+        assertTrue(r.configured);
+        assertEq(r.path[0], usdc);
+        assertEq(r.path[1], address(0));
+    }
+
+    function test_setRoute_rejectsNoHopRewardRouteWithTrailingEntry() public {
+        address[11] memory path;
+        path[0] = usdc;
+        path[2] = other;
+        vm.prank(owner);
+        vm.expectRevert(abi.encodeWithSignature("InvalidRouteGap(uint256)", 2));
+        harvester.setRoute(usdc, path, _params(), _pools());
     }
 
     function test_setRoute_validatesAgainstCurrentRewardToken() public {

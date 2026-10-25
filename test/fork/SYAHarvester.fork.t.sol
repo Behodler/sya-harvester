@@ -17,6 +17,7 @@ import {SYAHarvester} from "../../src/SYAHarvester.sol";
 import {ICurveRouterNG} from "../../src/interfaces/ICurveRouterNG.sol";
 import {MainnetAddresses as A} from "./MainnetAddresses.sol";
 import {MainnetRoutes} from "./MainnetRoutes.sol";
+import {MockCurveRouter} from "../mocks/MockCurveRouter.sol";
 
 interface ICurvePoolCoins {
     function coins(uint256 i) external view returns (address);
@@ -404,5 +405,66 @@ contract SYAHarvesterForkTest is Test, IUnlockCallback {
         assertGe(harvester.GAS_OVERHEAD(), gap, "GAS_OVERHEAD does not cover the measured gap");
         // and is not wildly padded: within 25k gas of the measured gap
         assertLe(harvester.GAS_OVERHEAD(), gap + 25_000, "GAS_OVERHEAD over-padded");
+    }
+
+    // ------------------------------------------------------------------ audit 01, M-01: Router NG contiguity
+
+    /// @dev The audit's mis-entered USDe route: USDe -> [USDe/crvUSD] -> crvUSD -> <empty pool slot> ... USDC.
+    ///      Router NG stops at the empty `path[3]` and delivers crvUSD; the trailing USDC is never reached.
+    function _gapPath() internal pure returns (address[11] memory gap) {
+        gap[0] = A.USDE;
+        gap[1] = MainnetRoutes.POOL_USDE_CRVUSD;
+        gap[2] = A.CRVUSD;
+        gap[10] = A.USDC;
+    }
+
+    function test_fork_M01_gapRoute_rejectedBySetRoute() public {
+        MainnetRoutes.Route memory u = MainnetRoutes.usdeRoute();
+        vm.prank(owner);
+        vm.expectRevert(abi.encodeWithSignature("InvalidRouteGap(uint256)", 10));
+        harvester.setRoute(A.USDE, _gapPath(), u.swapParams, u.pools);
+
+        // the shipped contiguous route is still the one stored
+        SYAHarvester.CurveRoute memory r = harvester.getRoute(A.USDE);
+        assertEq(r.path[3], MainnetRoutes.POOL_CRVUSD_USDC, "contiguous route kept");
+        assertEq(r.path[10], address(0));
+    }
+
+    function test_fork_M01_contiguousRoute_harvestsAndLeavesHarvesterEmpty() public {
+        vm.txGasPrice(0); // isolate the route effect from the gas-profitability gate
+        uint256 ethOut = _harvest(_none(), 0);
+        assertGt(ethOut, 0, "harvest paid ETH");
+        _assertHarvesterEmpty(); // includes crvUSD, the USDe route's intermediate token
+    }
+
+    /// @notice Ground truth for the unit-test double: the REAL Router NG, given the gap path, delivers crvUSD
+    ///         (path[2]) and no USDC, and `MockCurveRouter` resolves the same path to the same token.
+    function test_fork_M01_realRouterDeliversIntermediate_mockAgrees() public {
+        MainnetRoutes.Route memory u = MainnetRoutes.usdeRoute();
+        address[11] memory gap = _gapPath();
+        uint256 amount = 1_000e18;
+
+        // real Router NG
+        deal(A.USDE, address(this), amount);
+        IERC20(A.USDE).approve(A.CURVE_ROUTER_NG, amount);
+        uint256 crvBefore = IERC20(A.CRVUSD).balanceOf(address(this));
+        uint256 usdcBefore = IERC20(A.USDC).balanceOf(address(this));
+        uint256 out = ICurveRouterNG(A.CURVE_ROUTER_NG).exchange(gap, u.swapParams, amount, 0, u.pools, address(this));
+        uint256 crvGot = IERC20(A.CRVUSD).balanceOf(address(this)) - crvBefore;
+        assertGt(out, 0, "router output");
+        assertEq(crvGot, out, "real Router NG delivered crvUSD (path[2])");
+        assertEq(IERC20(A.USDC).balanceOf(address(this)), usdcBefore, "real Router NG delivered no USDC");
+
+        // the unit-test double resolves the same path to the same token
+        MockCurveRouter mock = new MockCurveRouter();
+        mock.setRate(A.USDE, 1e18);
+        deal(A.CRVUSD, address(mock), amount);
+        deal(A.USDC, address(mock), amount);
+        deal(A.USDE, address(this), amount);
+        IERC20(A.USDE).approve(address(mock), amount);
+        crvBefore = IERC20(A.CRVUSD).balanceOf(address(this));
+        mock.exchange(gap, u.swapParams, amount, 0, u.pools, address(this));
+        assertEq(IERC20(A.CRVUSD).balanceOf(address(this)) - crvBefore, amount, "mock delivered crvUSD too");
+        assertEq(IERC20(A.USDC).balanceOf(address(this)), usdcBefore, "mock delivered no USDC");
     }
 }
